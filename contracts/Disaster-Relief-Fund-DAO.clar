@@ -87,6 +87,7 @@
                 voting-power: (+ (get voting-power member-data) u1)
             })
         )
+        (log-audit-event ACTION-CONTRIBUTION none (some amount) none)
         (ok true)
     )
 )
@@ -104,6 +105,7 @@
                 declaration-height: current-height
             })
             (var-set active-disaster-id (some (var-get proposal-counter)))
+            (log-audit-event ACTION-DISASTER-DECLARED (some (var-get proposal-counter)) (some required-funds) (some location))
             (ok (var-get proposal-counter))
         )
     )
@@ -124,6 +126,7 @@
                 no-votes: u0,
                 status: "active"
             })
+            (log-audit-event ACTION-PROPOSAL-CREATED (some (var-get proposal-counter)) (some amount) none)
             (ok (var-get proposal-counter))
         )
     )
@@ -144,6 +147,7 @@
                 no-votes: (if vote-bool (get no-votes proposal) (+ (get no-votes proposal) (get voting-power member)))
             })
         )
+        (log-audit-event ACTION-VOTE-CAST (some proposal-id) none (some (if vote-bool "yes" "no")))
         (ok true)
     )
 )
@@ -161,6 +165,7 @@
                 (try! (as-contract (stx-transfer? (get amount proposal) tx-sender (get recipient proposal))))
                 (var-set total-funds (- (var-get total-funds) (get amount proposal)))
                 (map-set proposals proposal-id (merge proposal {status: "executed"}))
+                (log-audit-event ACTION-PROPOSAL-EXECUTED (some proposal-id) (some (get amount proposal)) none)
                 (ok true)
             )
             (begin
@@ -260,6 +265,7 @@
                 status: "active",
                 justification: justification
             })
+            (log-audit-event ACTION-EMERGENCY-PROPOSAL (some (var-get proposal-counter)) (some amount) (some justification))
             (ok (var-get proposal-counter))
         )
     )
@@ -509,6 +515,7 @@
                     status: (if (is-eq next-milestone total-milestones) "completed" "active")
                 })
             )
+            (log-audit-event ACTION-MILESTONE-COMPLETED (some proposal-id) (some milestone-amount) none)
             (ok true)
         )
     )
@@ -544,4 +551,49 @@
 
 (define-read-only (get-milestone-info (proposal-id uint) (milestone-index uint))
     (map-get? milestones {proposal-id: proposal-id, milestone-index: milestone-index})
+)
+
+(define-constant ACTION-CONTRIBUTION "contribute")
+(define-constant ACTION-DISASTER-DECLARED "disaster-declared")
+(define-constant ACTION-PROPOSAL-CREATED "proposal-created")
+(define-constant ACTION-VOTE-CAST "vote-cast")
+(define-constant ACTION-PROPOSAL-EXECUTED "proposal-executed")
+(define-constant ACTION-EMERGENCY-PROPOSAL "emergency-proposal")
+(define-constant ACTION-MILESTONE-COMPLETED "milestone-completed")
+
+(define-data-var audit-counter uint u0)
+
+(define-map audit-trail
+    uint
+    {
+        action: (string-ascii 20),
+        actor: principal,
+        target-id: (optional uint),
+        amount: (optional uint),
+        block-height: uint,
+        additional-info: (optional (string-ascii 200))
+    }
+)
+
+(define-private (log-audit-event (action (string-ascii 20)) (target-id (optional uint)) (amount (optional uint)) (info (optional (string-ascii 200))))
+    (let ((audit-id (+ (var-get audit-counter) u1)))
+        (var-set audit-counter audit-id)
+        (map-set audit-trail audit-id {
+            action: action,
+            actor: tx-sender,
+            target-id: target-id,
+            amount: amount,
+            block-height: burn-block-height,
+            additional-info: info
+        })
+        audit-id
+    )
+)
+
+(define-read-only (get-audit-event (audit-id uint))
+    (map-get? audit-trail audit-id)
+)
+
+(define-read-only (get-total-audit-events)
+    (var-get audit-counter)
 )
