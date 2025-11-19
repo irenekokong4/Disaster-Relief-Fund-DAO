@@ -915,3 +915,315 @@
         }
     }
 )
+
+(define-constant ERR-ACCOUNTABILITY-NOT-FOUND (err u300))
+(define-constant ERR-INVALID-ROI-VALUE (err u301))
+(define-constant ERR-ACCOUNTABILITY-UNAUTHORIZED (err u302))
+(define-constant ERR-SPENDING-EXCEEDS-ALLOCATION (err u303))
+(define-constant ERR-INVALID-STATUS-CHANGE (err u304))
+(define-constant ERR-AUDIT-REQUEST-DUPLICATE (err u305))
+
+(define-data-var accountability-counter uint u0)
+(define-data-var audit-request-counter uint u0)
+(define-data-var accountability-enabled bool true)
+
+(define-map resource-allocations
+    uint
+    {
+        disaster-id: uint,
+        allocated-amount: uint,
+        allocated-by: principal,
+        allocation-timestamp: uint,
+        purpose: (string-ascii 100),
+        status: (string-ascii 15)
+    }
+)
+
+(define-map spending-records
+    uint
+    {
+        allocation-id: uint,
+        spent-amount: uint,
+        recipient: principal,
+        spending-timestamp: uint,
+        description: (string-ascii 100),
+        verified-by: (optional principal)
+    }
+)
+
+(define-map roi-metrics
+    uint
+    {
+        allocation-id: uint,
+        expected-impact: uint,
+        actual-impact: uint,
+        impact-unit: (string-ascii 30),
+        roi-percentage: uint,
+        measurement-timestamp: uint,
+        validator: principal
+    }
+)
+
+(define-map allocation-summary
+    uint
+    {
+        total-allocated: uint,
+        total-spent: uint,
+        total-returned: uint,
+        spending-records-count: uint,
+        roi-records-count: uint,
+        last-updated: uint
+    }
+)
+
+(define-map audit-requests
+    uint
+    {
+        allocation-id: uint,
+        requestor: principal,
+        request-timestamp: uint,
+        reason: (string-ascii 100),
+        status: (string-ascii 15),
+        audit-result: (optional (string-ascii 100))
+    }
+)
+
+(define-public (create-resource-allocation (disaster-id uint) (amount uint) (purpose (string-ascii 100)))
+    (let (
+        (current-height burn-block-height)
+        (allocation-id (+ (var-get accountability-counter) u1))
+    )
+        (asserts! (var-get accountability-enabled) ERR-ACCOUNTABILITY-UNAUTHORIZED)
+        (asserts! (is-some (map-get? disasters disaster-id)) ERR-NO-ACTIVE-DISASTER)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (<= amount (var-get total-funds)) ERR-INSUFFICIENT-BALANCE)
+        
+        (var-set accountability-counter allocation-id)
+        (map-set resource-allocations allocation-id {
+            disaster-id: disaster-id,
+            allocated-amount: amount,
+            allocated-by: tx-sender,
+            allocation-timestamp: current-height,
+            purpose: purpose,
+            status: "active"
+        })
+        (map-set allocation-summary allocation-id {
+            total-allocated: amount,
+            total-spent: u0,
+            total-returned: u0,
+            spending-records-count: u0,
+            roi-records-count: u0,
+            last-updated: current-height
+        })
+        (log-audit-event "allocation-created" (some allocation-id) (some amount) (some purpose))
+        (ok allocation-id)
+    )
+)
+
+(define-public (record-spending (allocation-id uint) (spent-amount uint) (recipient principal) (description (string-ascii 100)))
+    (let (
+        (current-height burn-block-height)
+        (allocation (unwrap! (map-get? resource-allocations allocation-id) ERR-ACCOUNTABILITY-NOT-FOUND))
+        (summary (unwrap! (map-get? allocation-summary allocation-id) ERR-ACCOUNTABILITY-NOT-FOUND))
+        (new-total-spent (+ (get total-spent summary) spent-amount))
+        (spending-id (+ (var-get audit-request-counter) u1))
+    )
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-ACCOUNTABILITY-UNAUTHORIZED)
+        (asserts! (> spent-amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (<= new-total-spent (get allocated-amount allocation)) ERR-SPENDING-EXCEEDS-ALLOCATION)
+        (asserts! (is-eq (get status allocation) "active") ERR-INVALID-STATUS-CHANGE)
+        
+        (map-set spending-records spending-id {
+            allocation-id: allocation-id,
+            spent-amount: spent-amount,
+            recipient: recipient,
+            spending-timestamp: current-height,
+            description: description,
+            verified-by: none
+        })
+        
+        (map-set allocation-summary allocation-id 
+            (merge summary {
+                total-spent: new-total-spent,
+                spending-records-count: (+ (get spending-records-count summary) u1),
+                last-updated: current-height
+            })
+        )
+        (log-audit-event "spending-recorded" (some allocation-id) (some spent-amount) (some description))
+        (ok spending-id)
+    )
+)
+
+(define-public (verify-spending (spending-id uint))
+    (let (
+        (spending (unwrap! (map-get? spending-records spending-id) ERR-ACCOUNTABILITY-NOT-FOUND))
+    )
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-ACCOUNTABILITY-UNAUTHORIZED)
+        (asserts! (is-none (get verified-by spending)) ERR-INVALID-STATUS-CHANGE)
+        
+        (map-set spending-records spending-id 
+            (merge spending {verified-by: (some tx-sender)})
+        )
+        (log-audit-event "spending-verified" (some spending-id) none (some "Spending verified by DAO owner"))
+        (ok true)
+    )
+)
+
+(define-public (record-roi-metric (allocation-id uint) (expected-impact uint) (actual-impact uint) (impact-unit (string-ascii 30)))
+    (let (
+        (current-height burn-block-height)
+        (allocation (unwrap! (map-get? resource-allocations allocation-id) ERR-ACCOUNTABILITY-NOT-FOUND))
+        (summary (unwrap! (map-get? allocation-summary allocation-id) ERR-ACCOUNTABILITY-NOT-FOUND))
+        (allocated-amount (get allocated-amount allocation))
+        (spent-amount (get total-spent summary))
+        (roi-calc (if (> spent-amount u0) (/ (* actual-impact u100) spent-amount) u0))
+        (roi-id (var-get accountability-counter))
+    )
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-ACCOUNTABILITY-UNAUTHORIZED)
+        (asserts! (> actual-impact u0) ERR-INVALID-ROI-VALUE)
+        
+        (map-set roi-metrics roi-id {
+            allocation-id: allocation-id,
+            expected-impact: expected-impact,
+            actual-impact: actual-impact,
+            impact-unit: impact-unit,
+            roi-percentage: roi-calc,
+            measurement-timestamp: current-height,
+            validator: tx-sender
+        })
+        
+        (map-set allocation-summary allocation-id 
+            (merge summary {
+                roi-records-count: (+ (get roi-records-count summary) u1),
+                last-updated: current-height
+            })
+        )
+        (log-audit-event "roi-recorded" (some allocation-id) (some actual-impact) (some impact-unit))
+        (ok roi-id)
+    )
+)
+
+(define-public (request-audit (allocation-id uint) (reason (string-ascii 100)))
+    (let (
+        (current-height burn-block-height)
+        (allocation (unwrap! (map-get? resource-allocations allocation-id) ERR-ACCOUNTABILITY-NOT-FOUND))
+        (request-id (+ (var-get audit-request-counter) u1))
+    )
+        (asserts! (var-get accountability-enabled) ERR-ACCOUNTABILITY-UNAUTHORIZED)
+        (asserts! (is-some (map-get? dao-members tx-sender)) ERR-NOT-AUTHORIZED)
+        
+        (var-set audit-request-counter request-id)
+        (map-set audit-requests request-id {
+            allocation-id: allocation-id,
+            requestor: tx-sender,
+            request-timestamp: current-height,
+            reason: reason,
+            status: "pending",
+            audit-result: none
+        })
+        (log-audit-event "audit-requested" (some allocation-id) none (some reason))
+        (ok request-id)
+    )
+)
+
+(define-public (resolve-audit-request (request-id uint) (result (string-ascii 100)))
+    (let (
+        (request (unwrap! (map-get? audit-requests request-id) ERR-ACCOUNTABILITY-NOT-FOUND))
+    )
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-ACCOUNTABILITY-UNAUTHORIZED)
+        (asserts! (is-eq (get status request) "pending") ERR-INVALID-STATUS-CHANGE)
+        
+        (map-set audit-requests request-id 
+            (merge request {
+                status: "resolved",
+                audit-result: (some result)
+            })
+        )
+        (log-audit-event "audit-resolved" (some request-id) none (some result))
+        (ok true)
+    )
+)
+
+(define-public (close-allocation (allocation-id uint))
+    (let (
+        (allocation (unwrap! (map-get? resource-allocations allocation-id) ERR-ACCOUNTABILITY-NOT-FOUND))
+        (summary (unwrap! (map-get? allocation-summary allocation-id) ERR-ACCOUNTABILITY-NOT-FOUND))
+    )
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-ACCOUNTABILITY-UNAUTHORIZED)
+        (asserts! (is-eq (get status allocation) "active") ERR-INVALID-STATUS-CHANGE)
+        
+        (let (
+            (unspent-amount (- (get allocated-amount allocation) (get total-spent summary)))
+        )
+            (map-set resource-allocations allocation-id 
+                (merge allocation {status: "closed"})
+            )
+            (map-set allocation-summary allocation-id 
+                (merge summary {total-returned: unspent-amount})
+            )
+            (var-set total-funds (+ (var-get total-funds) unspent-amount))
+            (log-audit-event "allocation-closed" (some allocation-id) (some unspent-amount) (some "Allocation closed, funds returned"))
+            (ok true)
+        )
+    )
+)
+
+(define-public (toggle-accountability-monitoring (enabled bool))
+    (begin
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-ACCOUNTABILITY-UNAUTHORIZED)
+        (var-set accountability-enabled enabled)
+        (log-audit-event "acctbl-toggled" none none (some (if enabled "Enabled" "Disabled")))
+        (ok enabled)
+    )
+)
+
+(define-read-only (get-resource-allocation (allocation-id uint))
+    (map-get? resource-allocations allocation-id)
+)
+
+(define-read-only (get-spending-record (spending-id uint))
+    (map-get? spending-records spending-id)
+)
+
+(define-read-only (get-roi-metric (roi-id uint))
+    (map-get? roi-metrics roi-id)
+)
+
+(define-read-only (get-allocation-summary (allocation-id uint))
+    (map-get? allocation-summary allocation-id)
+)
+
+(define-read-only (get-audit-request (request-id uint))
+    (map-get? audit-requests request-id)
+)
+
+(define-read-only (get-accountability-status)
+    {
+        enabled: (var-get accountability-enabled),
+        total-allocations: (var-get accountability-counter),
+        total-audit-requests: (var-get audit-request-counter)
+    }
+)
+
+(define-read-only (calculate-allocation-efficiency (allocation-id uint))
+    (match (map-get? resource-allocations allocation-id)
+        allocation (match (map-get? allocation-summary allocation-id)
+            summary (let (
+                (allocated (get allocated-amount allocation))
+                (spent (get total-spent summary))
+                (efficiency (if (> allocated u0) (/ (* spent u100) allocated) u0))
+            )
+                (ok {
+                    allocated-amount: allocated,
+                    spent-amount: spent,
+                    efficiency-percentage: efficiency,
+                    unspent-amount: (- allocated spent),
+                    spending-count: (get spending-records-count summary),
+                    roi-count: (get roi-records-count summary)
+                })
+            )
+            ERR-ACCOUNTABILITY-NOT-FOUND
+        )
+        ERR-ACCOUNTABILITY-NOT-FOUND
+    )
+)
